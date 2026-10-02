@@ -8,17 +8,17 @@ Tools like NetExec (`nxc smb`) only discover hosts over SMB (port 445). If a hos
 
 ## What It Checks
 
-**Phase 1 - Port Discovery:** Scans 14 common ports (HTTP, HTTPS, RPC, SMB, LDAP, LDAPS, Kerberos, WinRM, and others) to map the attack surface.
+**Phase 1 — Port Discovery:** Scans 14 common ports (HTTP, HTTPS, RPC, SMB, LDAP, LDAPS, Kerberos, WinRM, and others) to map the attack surface.
 
-**Phase 2 - WebDAV Detection (no SMB needed):** Sends HTTP OPTIONS and PROPFIND requests to detect WebDAV support purely over HTTP. Also checks for NTLM challenges on HTTP, HTTPS, and WinRM ports. This is the primary check that SMB-only tools miss entirely.
+**Phase 2 — WebDAV Detection (no SMB needed):** Sends HTTP OPTIONS and PROPFIND requests to detect WebDAV support purely over HTTP. Also checks for NTLM challenges on HTTP, HTTPS, and WinRM ports. This is the primary check that SMB-only tools miss entirely.
 
-**Phase 3 - RPC Coercion Viability:** Probes the RPC Endpoint Mapper (port 135) to confirm MS-EFSR (PetitPotam), MS-RPRN (PrinterBug), and MS-DFSNM coercion paths are reachable.
+**Phase 3 — RPC Coercion Viability:** Probes the RPC Endpoint Mapper (port 135) to confirm MS-EFSR (PetitPotam), MS-RPRN (PrinterBug), and MS-DFSNM coercion paths are reachable.
 
-**Phase 4 - SMB WebClient Service Query:** When SMB is available and credentials are provided, queries the WebClient service state via SVCCTL. This is a bonus check on top of the HTTP-based detection.
+**Phase 4 — SMB WebClient Service Query:** When SMB is available and credentials are provided, queries the WebClient service state via SVCCTL. This is a bonus check on top of the HTTP-based detection.
 
-**Phase 5 - LDAP Relay Target Assessment:** Tests LDAP signing and LDAPS channel binding enforcement to determine if relay to LDAP or LDAPS is viable.
+**Phase 5 — LDAP Relay Target Assessment:** Tests LDAP signing and LDAPS channel binding enforcement to determine if relay to LDAP or LDAPS is viable.
 
-**Phase 6 - Verdict:** Combines all findings and flags full attack chains. The critical finding is WebDAV coercion (no MIC) combined with LDAP signing or channel binding not required, which gives a complete coercion-to-relay path.
+**Phase 6 — Verdict:** Combines all findings and flags full attack chains. The critical finding is WebDAV coercion (no MIC) combined with LDAP signing or channel binding not required, which gives a complete coercion-to-relay path.
 
 ## Requirements
 
@@ -87,17 +87,28 @@ python3 webdav-check.py -t 10.0.0.0/24 -l 10.200.0.15 --timeout 5
 | `-p`, `--password` | No | Password for the domain account |
 | `-d`, `--domain` | No | Domain name (defaults to `.`) |
 | `--timeout` | No | Connection timeout in seconds (defaults to 3) |
+| `-v`, `--verbose` | No | Show all output including debug steps, port scans, and negative results (default: findings only) |
+
+## Output Modes
+
+By default, the scanner only shows hosts with positive findings (CRIT or WARN results). Hosts with no findings are silently skipped, with a progress counter shown during the scan. This keeps subnet scans clean and readable.
+
+Use `--verbose` (`-v`) to see the full step-by-step output for every host, including port scans, negative results, and debug information:
+
+```bash
+python3 webdav-check.py -t 10.0.0.0/24 -l 10.200.0.15 --verbose
+```
 
 ## Understanding the Output
 
 The scanner uses color-coded tags for every step so you can see exactly where each check succeeded or failed:
 
-- **[PASS]** (green) - Check passed, the control is in place (good for the defender, bad for the attacker)
-- **[FAIL]** (gray) - Check could not run (port closed, connection failed, missing dependency)
-- **[WARN]** (yellow) - Something worth investigating (service stopped but startable, Negotiate offered)
-- **[CRIT]** (red) - Exploitable finding (WebDAV active, NTLM over HTTP, LDAP signing not required)
-- **[INFO]** (cyan) - Informational context
-- **[STEP]** (white) - Shows which check is running right now
+- **[PASS]** (green) — Check passed, the control is in place (good for the defender, bad for the attacker)
+- **[FAIL]** (gray) — Check could not run (port closed, connection failed, missing dependency)
+- **[WARN]** (yellow) — Something worth investigating (service stopped but startable, Negotiate offered)
+- **[CRIT]** (red) — Exploitable finding (WebDAV active, NTLM over HTTP, LDAP signing not required)
+- **[INFO]** (cyan) — Informational context
+- **[STEP]** (white) — Shows which check is running right now
 
 A **CRITICAL** chain in the final verdict means both sides of the attack are confirmed: the target can be coerced into sending HTTP-based NTLM authentication (which carries no MIC), and a relay target accepts that authentication without enforcing signing or channel binding.
 
