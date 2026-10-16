@@ -355,12 +355,87 @@ def check_rpc_endpoints(host, timeout=5):
         return False
 
 
+# ── WebClient named-pipe probe (primary, matches nxc -M webdav) ──────────────
+
+def check_webdav_pipe(host, domain, username, password, timeout=5):
+    """
+    Detect the WebClient service by opening the named pipe
+    \\PIPE\\DAV RPC SERVICE over SMB. This is the same signal nxc's
+    `-M webdav` module uses, and it is the check the old HTTP-only
+    scanner was missing, which is why nxc reported WebClient hosts
+    that the old tool called "no WebDAV".
+
+    A host with this pipe present has WebClient RUNNING, which makes it
+    a WebDAV coercion victim: coerced auth leaves the host over HTTP
+    with no MIC, so it can be relayed to LDAP/LDAPS. This is true whether
+    or not the host serves any WebDAV content over HTTP, so this SMB-side
+    probe, not the HTTP OPTIONS/PROPFIND check, is the one that matters
+    for coercion.
+
+    Works over a null or guest session where the target allows it, so it
+    can find WebClient hosts with no credentials. With -u/-p it runs
+    authenticated for full parity with nxc. Returns True only when the
+    pipe is confirmed present.
+    """
+    try:
+        from impacket.smbconnection import SMBConnection
+        from impacket.dcerpc.v5 import transport
+    except ImportError:
+        vprint(f"      {FAIL} impacket not available. Skipping WebClient pipe probe")
+        return False
+
+    smb = None
+    try:
+        smb = SMBConnection(host, host, timeout=timeout)
+        if username and password:
+            smb.login(username, password, domain if domain != "." else "")
+            vprint(f"      {PASS} SMB session established (authenticated)")
+        else:
+            # Fall back to a null session, then guest, for unauthenticated discovery
+            try:
+                smb.login("", "")
+                vprint(f"      {INFO} SMB null session established")
+            except Exception:
+                smb.login("guest", "")
+                vprint(f"      {INFO} SMB guest session established")
+
+        # Opening the pipe is enough to confirm it exists. We do NOT bind to a
+        # DCE interface, we only care whether the create succeeds.
+        rpc = transport.SMBTransport(host, 445, r"\DAV RPC SERVICE", smb_connection=smb)
+        dce = rpc.get_dce_rpc()
+        dce.connect()
+        dce.disconnect()
+        vprint(f"      {CRIT} DAV RPC SERVICE pipe present -> WebClient RUNNING")
+        smb.close()
+        return True
+    except Exception as e:
+        estr = str(e)
+        low = estr.lower()
+        if "STATUS_OBJECT_NAME_NOT_FOUND" in estr or "0xc0000034" in low:
+            vprint(f"      {INFO} WebClient not running (DAV RPC SERVICE pipe absent)")
+        elif "STATUS_ACCESS_DENIED" in estr or "access_denied" in low:
+            vprint(f"      {WARN} Access denied opening DAV pipe (session up, try other creds)")
+        elif "logon_failure" in low or "STATUS_LOGON_FAILURE" in estr:
+            vprint(f"      {INFO} Null/guest session refused; provide -u/-p to probe the pipe")
+        else:
+            vprint(f"      {FAIL} WebClient pipe probe error: {e}")
+        if smb:
+            try:
+                smb.close()
+            except Exception:
+                pass
+        return False
+
+
 # ── SMB WebClient pipe check (bonus, only when SMB is available) ─────────────
 
 def check_webclient_smb_auth(host, domain, username, password):
     """
     Authenticated check of WebClient service state via SVCCTL over SMB.
-    This is a BONUS check when SMB is available, not the primary method.
+    This is a BONUS check when SMB is available and credentials are
+    supplied. The pipe probe above is the primary RUNNING signal; this
+    adds the STOPPED-but-installed (startable) distinction that the pipe
+    probe cannot see.
     """
     vprint(f"    {STEP} Querying WebClient service via SMB/SVCCTL (authenticated)...")
     try:
@@ -376,9 +451,9 @@ def check_webclient_smb_auth(host, domain, username, password):
         dce.connect()
         dce.bind(scmr.MSRPC_UUID_SCMR)
 
-        scm = scmr.hROpenSCManagerW(dce)["lpScHandle"]
+        scm = scmr.hROpenSCManagerW(dce, dwDesiredAccess=scmr.SC_MANAGER_CONNECT)["lpScHandle"]
         try:
-            svc = scmr.hROpenServiceW(dce, scm, "WebClient")["lpServiceHandle"]
+            svc = scmr.hROpenServiceW(dce, scm, "WebClient", dwDesiredAccess=scmr.SERVICE_QUERY_STATUS)["lpServiceHandle"]
             status = scmr.hRQueryServiceStatus(dce, svc)
             state = status["lpServiceStatus"]["dwCurrentState"]
             start_type = status["lpServiceStatus"]["dwServiceType"]
@@ -389,9 +464,9 @@ def check_webclient_smb_auth(host, domain, username, password):
             state_str = states.get(state, f"UNKNOWN({state})")
 
             if state == 4:
-                print(f"      {CRIT} WebClient service is RUNNING")
+                vprint(f"      {CRIT} WebClient service is RUNNING")
             elif state == 1:
-                print(f"      {WARN} WebClient service is STOPPED (can potentially be started remotely)")
+                vprint(f"      {WARN} WebClient service is STOPPED (can potentially be started remotely)")
             else:
                 vprint(f"      {INFO} WebClient service state: {state_str}")
 
@@ -413,11 +488,14 @@ def check_webclient_smb_auth(host, domain, username, password):
         return "NO_IMPACKET"
     except Exception as e:
         err = str(e).lower()
-        if "logon_failure" in err or "access_denied" in err:
+        if "logon_failure" in err:
             vprint(f"      {FAIL} Authentication failed for SMB service query")
             return "AUTH_FAILED"
+        if "access_denied" in err:
+            vprint(f"      {FAIL} Access denied querying SCM (SMB auth succeeded, insufficient privileges)")
+            return "ACCESS_DENIED"
         vprint(f"      {FAIL} SMB service query error: {e}")
-        return f"ERROR"
+        return "ERROR"
 
 
 # ── LDAP Signing & Channel Binding ───────────────────────────────────────────
@@ -561,19 +639,27 @@ def analyse_host(host, listener_ip, args):
         vprint(f"    {WARN} SMB (445) open without RPC (135). Named pipe coercion may still work")
         rpc_viable = True
 
-    # ── Phase 4: SMB WebClient service check (bonus, when SMB available) ─
-    vprint(f"\n  {C.BOLD}Phase 4: SMB-based WebClient Service Query (bonus check){C.RESET}")
+    # ── Phase 4: WebClient service detection (pipe probe + bonus SVCCTL) ─
+    vprint(f"\n  {C.BOLD}Phase 4: WebClient Service Detection (SMB){C.RESET}")
 
     webclient_state = "UNCHECKED"
+    webclient_pipe = False
     if has_smb:
+        # Primary: named-pipe probe. Matches nxc -M webdav, works with or
+        # without creds, and is the signal the old HTTP-only tool lacked.
+        vprint(f"    {STEP} Probing \\PIPE\\DAV RPC SERVICE for WebClient...")
+        webclient_pipe = check_webdav_pipe(host, args.domain, args.username,
+                                           args.password, args.timeout)
+        # Bonus: SVCCTL gives the STOPPED-but-installed (startable) detail,
+        # which the pipe probe cannot see. Needs credentials.
         if has_creds:
-            webclient_state = check_webclient_smb_auth(host, args.domain, args.username, args.password)
+            webclient_state = check_webclient_smb_auth(host, args.domain,
+                                                       args.username, args.password)
         else:
-            vprint(f"    {INFO} SMB is open but no credentials provided. Cannot query service state")
-            vprint(f"    {INFO} Provide -u/-p/-d for authenticated WebClient service check")
+            vprint(f"    {INFO} No creds: SVCCTL state query skipped (pipe probe is primary)")
             webclient_state = "NO_CREDS"
     else:
-        vprint(f"    {INFO} SMB (445) closed. Skipping SMB-based check (HTTP checks above are primary)")
+        vprint(f"    {INFO} SMB (445) closed. Cannot probe WebClient pipe over SMB")
 
     # ── Phase 5: LDAP relay target assessment ────────────────────────────
     vprint(f"\n  {C.BOLD}Phase 5: LDAP Relay Target Assessment{C.RESET}")
@@ -590,12 +676,16 @@ def analyse_host(host, listener_ip, args):
     # ── Phase 6: Verdict ─────────────────────────────────────────────────
 
     coercion_possible = rpc_viable or has_smb
-    webdav_coercion = (
-        webdav_found or
-        webclient_state == "RUNNING" or
-        ntlm_over_http
-    )
-    webclient_startable = webclient_state == "STOPPED"
+    # WebDAV HTTP listener (IIS/similar serving DAV) — a relay *target* finding,
+    # distinct from WebClient service which makes a host a coercion *victim*
+    webdav_http_listener = webdav_found
+    # WebClient RUNNING (coercion victim): pipe probe is authoritative, SVCCTL
+    # RUNNING is a secondary confirmation when creds were supplied.
+    webclient_running = webclient_pipe or webclient_state == "RUNNING"
+    webclient_startable = (not webclient_running) and webclient_state == "STOPPED"
+    # Coercion victim: WebClient running sends auth over HTTP (no MIC),
+    # or server already challenges with NTLM over HTTP
+    webdav_coercion = webclient_running or ntlm_over_http
 
     ldap_relay_open = (
         ldap_info and
@@ -608,6 +698,7 @@ def analyse_host(host, listener_ip, args):
     has_findings = (
         critical or
         webdav_coercion or
+        webdav_http_listener or
         webclient_startable or
         ntlm_over_http or
         ldap_relay_open
@@ -619,6 +710,7 @@ def analyse_host(host, listener_ip, args):
             "host": host,
             "coercion": coercion_possible,
             "webdav": webdav_coercion,
+            "webdav_http_listener": webdav_http_listener,
             "webclient_startable": webclient_startable,
             "ntlm_http": ntlm_over_http,
             "ldap_relay": ldap_relay_open,
@@ -644,17 +736,19 @@ def analyse_host(host, listener_ip, args):
     else:
         vprint(f"    {FAIL} Standard coercion: NO (no RPC or SMB)")
 
-    # WebDAV verdict
-    if webclient_state == "RUNNING":
-        print(f"    {CRIT} WebClient service: RUNNING (confirmed via SMB)")
+    # WebDAV verdict — separate WebClient service (coercion victim) from HTTP listener
+    if webclient_running:
+        src = "DAV RPC SERVICE pipe" if webclient_pipe else "SVCCTL query"
+        print(f"    {CRIT} WebClient service: RUNNING (confirmed via {src})")
         print(f"         WebDAV coercion will send auth over HTTP (no MIC enforcement)")
-    elif webdav_found:
-        print(f"    {CRIT} WebDAV: DETECTED via HTTP probe (DAV headers or PROPFIND response)")
-        print(f"         This host accepts WebDAV requests, coerced auth goes over HTTP (no MIC)")
-    elif ntlm_over_http:
+    if webdav_http_listener:
+        print(f"    {WARN} WebDAV HTTP listener: DETECTED via HTTP probe (DAV headers or PROPFIND)")
+        print(f"         This host serves WebDAV over HTTP (IIS or similar), but this alone")
+        print(f"         does not make it a coercion victim — check WebClient service separately")
+    if ntlm_over_http and not webclient_running:
         print(f"    {CRIT} NTLM over HTTP: Server challenges with NTLM on HTTP")
         print(f"         HTTP-based NTLM relay possible if coercion triggers HTTP callback")
-    elif webclient_startable:
+    if not webclient_running and not webdav_http_listener and not ntlm_over_http and webclient_startable:
         print(f"    {WARN} WebClient service: STOPPED but installed")
         print(f"         Can be started remotely via .searchConnector-ms or .library-ms file")
         print(f"         If started, WebDAV coercion becomes viable")
@@ -714,6 +808,7 @@ def analyse_host(host, listener_ip, args):
         "host": host,
         "coercion": coercion_possible,
         "webdav": webdav_coercion,
+        "webdav_http_listener": webdav_http_listener,
         "webclient_startable": webclient_startable,
         "ntlm_http": ntlm_over_http,
         "ldap_relay": ldap_relay_open,
@@ -778,10 +873,10 @@ Examples:
             deps[mod] = False
 
     print(f"\n  {C.BOLD}Dependencies:{C.RESET}")
-    print(f"    impacket: {PASS + ' available' if deps['impacket'] else WARN + ' not found (SMB service query unavailable)'}")
+    print(f"    impacket: {PASS + ' available' if deps['impacket'] else WARN + ' not found (SMB pipe probe + service query unavailable)'}")
     print(f"    ldap3:    {PASS + ' available' if deps['ldap3'] else WARN + ' not found (LDAP signing/CB check unavailable)'}")
     vprint(f"\n  {C.GRAY}Note: HTTP-based WebDAV detection requires NO dependencies.{C.RESET}")
-    vprint(f"  {C.GRAY}This scanner works without impacket/ldap3, just with reduced checks.{C.RESET}")
+    vprint(f"  {C.GRAY}The WebClient pipe probe (primary coercion-victim signal) needs impacket.{C.RESET}")
 
     results = []
     for i, host in enumerate(targets):
@@ -808,6 +903,7 @@ Examples:
     total = len(results)
     coercible = [r for r in results if r["coercion"]]
     webdav_hosts = [r for r in results if r.get("webdav")]
+    webdav_listeners = [r for r in results if r.get("webdav_http_listener")]
     startable = [r for r in results if r.get("webclient_startable")]
     ntlm_http = [r for r in results if r.get("ntlm_http")]
     ldap_targets = [r for r in results if r.get("ldap_relay")]
@@ -818,6 +914,7 @@ Examples:
     print(f"  Domain Controllers:         {len(dcs)}")
     print(f"  Coercion candidates:        {len(coercible)}")
     print(f"  WebDAV coercion viable:     {len(webdav_hosts)}")
+    print(f"  WebDAV HTTP listeners:      {len(webdav_listeners)}")
     print(f"  WebClient startable:        {len(startable)}")
     print(f"  NTLM over HTTP:             {len(ntlm_http)}")
     print(f"  LDAP relay targets:         {len(ldap_targets)}")
@@ -828,9 +925,14 @@ Examples:
             print(f"    {CRIT} {r['host']} - WebDAV coercion (no MIC) -> LDAP/LDAPS relay")
 
     if webdav_hosts and not criticals:
-        print(f"\n  {C.YELLOW}WebDAV coercion possible (look for relay targets):{C.RESET}")
+        print(f"\n  {C.YELLOW}WebDAV coercion viable (WebClient running or NTLM over HTTP):{C.RESET}")
         for r in webdav_hosts:
             print(f"    {WARN} {r['host']}")
+
+    if webdav_listeners:
+        print(f"\n  {C.YELLOW}WebDAV HTTP listeners (IIS/similar, not coercion victims):{C.RESET}")
+        for r in webdav_listeners:
+            print(f"    {INFO} {r['host']}")
 
     if startable:
         print(f"\n  {C.YELLOW}WebClient stopped but startable:{C.RESET}")
